@@ -71,6 +71,14 @@ class TesterConfigValidators:
 
             return config.SUPPORTED_TESTER_MODELLING_REVERSE[key]
 
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(f"Invalid modelling: '{value}'.")
+
+        if value not in config.SUPPORTED_TESTER_MODELLING:
+            raise RuntimeError(f"Invalid modelling: '{value}'.")
+
+        return value
+
     @staticmethod
     def parse_date(date_str: str) -> datetime:
         try:

@@ -132,3 +132,13 @@ Werkzeug==3.1.4
 widgetsnbextension==4.0.15
 WTForms==3.2.1
 yfinance==1.1.0
+# Flask-SocketIO and its dependencies: required by the tester dashboard
+# (strategytester5/tester.py imports flask_socketio) but missing from the
+# freeze above.
+Flask-SocketIO==5.7.0
+bidict==0.24.1
+h11==0.16.0
+python-engineio==4.15.0
+python-socketio==5.17.0
+simple-websocket==1.1.0
+wsproto==1.3.2

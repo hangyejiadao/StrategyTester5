@@ -1016,7 +1016,7 @@ class StrategyTester:
 
             time.sleep(1)
             print(
-                "\n📈 Visualize this backtest inside MetaTrader 5:\n"
+                "\nVisualize this backtest inside MetaTrader 5:\n"
                 "attach the TradeReplay script (MQL5/Scripts) to the traded symbol's chart "
                 "to replay entries, exits, SL/TP levels and per-trade profit step by step."
             )
