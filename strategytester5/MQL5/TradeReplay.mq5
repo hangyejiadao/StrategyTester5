@@ -53,7 +53,7 @@ const string PREFIX = "ST5REPLAY_";
 //+------------------------------------------------------------------+
 int LoadEvents(ReplayEvent &events[])
 {
-   int handle = FileOpen(InpFileName, FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   int handle = FileOpen(InpFileName, FILE_READ | FILE_TXT | FILE_ANSI);
    if(handle == INVALID_HANDLE)
    {
       PrintFormat("TradeReplay: cannot open %s (error %d). Export a backtest first.", InpFileName, GetLastError());
@@ -62,12 +62,12 @@ int LoadEvents(ReplayEvent &events[])
 
    // skip the header line
    if(!FileIsEnding(handle))
-      FileReadLine(handle);
+      FileReadString(handle);
 
    int count = 0;
    while(!FileIsEnding(handle))
    {
-      string line = FileReadLine(handle);
+      string line = FileReadString(handle);
       if(StringLen(line) == 0)
          continue;
 
