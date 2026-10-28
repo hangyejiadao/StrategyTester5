@@ -693,3 +693,91 @@ socket.on(
         );
     }
 );
+
+// ---------------- Price chart with live trade annotations ----------------
+
+const priceTrace = {
+    x: [],
+    y: [],
+    type: "scatter",
+    mode: "lines",
+    name: "Price",
+    line: { color: "#f0b90b", width: 1 }
+};
+
+const entryTrace = {
+    x: [],
+    y: [],
+    text: [],
+    type: "scatter",
+    mode: "markers",
+    name: "Entries",
+    marker: { symbol: "triangle-up", size: 11, color: "#26a69a", line: { color: "white", width: 1 } },
+    hovertemplate: "%{text}<extra>Entry</extra>"
+};
+
+const exitTrace = {
+    x: [],
+    y: [],
+    text: [],
+    type: "scatter",
+    mode: "markers",
+    name: "Exits",
+    marker: { symbol: "triangle-down", size: 11, color: "#ef5350", line: { color: "white", width: 1 } },
+    hovertemplate: "%{text}<extra>Exit</extra>"
+};
+
+const priceLayout = {
+    title: { text: "Price & Trade Annotations", font: { color: "white" } },
+    paper_bgcolor: "#0b1626",
+    plot_bgcolor: "#0b1626",
+    xaxis: { title: "Time", color: "white", gridcolor: "#1d2b45" },
+    yaxis: { title: "Price", color: "white", gridcolor: "#1d2b45" },
+    shapes: []
+};
+
+Plotly.newPlot("priceChart", [priceTrace, entryTrace, exitTrace], priceLayout, { responsive: true });
+
+const annotationShapes = [];
+const MAX_PRICE_POINTS = 3000;
+
+socket.on("price_update", function (data) {
+    Plotly.extendTraces(
+        "priceChart",
+        { x: [[data.time]], y: [[(data.bid + data.ask) / 2]] },
+        [0],
+        MAX_PRICE_POINTS
+    );
+});
+
+socket.on("trade_annotation", function (data) {
+    const label = data.kind === "entry"
+        ? `${data.direction.toUpperCase()} ${data.volume} @ ${data.price}`
+        : `${data.direction.toUpperCase()} exit ${data.volume} @ ${data.price} (P/L: ${data.profit})`;
+
+    Plotly.extendTraces(
+        "priceChart",
+        { x: [[data.time]], y: [[data.price]], text: [[label]] },
+        [data.kind === "entry" ? 1 : 2]
+    );
+
+    if (data.kind === "entry") {
+        if (data.sl) {
+            annotationShapes.push({
+                type: "line", xref: "paper", x0: 0, x1: 1,
+                y0: data.sl, y1: data.sl,
+                line: { color: "#ef5350", width: 1, dash: "dot" }
+            });
+        }
+        if (data.tp) {
+            annotationShapes.push({
+                type: "line", xref: "paper", x0: 0, x1: 1,
+                y0: data.tp, y1: data.tp,
+                line: { color: "#26a69a", width: 1, dash: "dot" }
+            });
+        }
+        if (data.sl || data.tp) {
+            Plotly.relayout("priceChart", { shapes: annotationShapes });
+        }
+    }
+});

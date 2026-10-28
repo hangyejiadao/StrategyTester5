@@ -19,7 +19,7 @@ DEFAULT_TERMINAL_INFO_JSON = "TerminalInfo.json"
 
 SUPPORTED_TESTER_MODELLING = \
     {
-        # 0: "Every tick",
+        0: "Every tick",
         1: "1 minute OHLC",
         2: "Open price only",
         # 3: "Math calculations",

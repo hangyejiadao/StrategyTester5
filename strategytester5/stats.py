@@ -1,5 +1,6 @@
 import numpy as np
 from numba import njit
+from . import analytics
 from .MetaTrader5.api import MetaTrader5Constants
 from scipy.stats import linregress
 import pandas as pd
@@ -82,7 +83,8 @@ class TesterStats:
                  equity_curve: np.ndarray,
                  margin_level_curve: np.ndarray,
                  ticks: int,
-                 symbols: int
+                 symbols: int,
+                 times: np.ndarray = None
                  ):
 
         """ Initializes the TesterStats object with the provided data and computes all statistics.
@@ -104,6 +106,12 @@ class TesterStats:
         self.margin_level_curve = np.ascontiguousarray(np.asarray(margin_level_curve, dtype=np.float64)).reshape(-1)
         self.ticks_ = ticks
         self.symbols_ = symbols
+        self.curve_times = (
+            np.ascontiguousarray(np.asarray(times, dtype=np.float64)).reshape(-1)
+            if times is not None else None
+        )
+        self._advanced_cache = None
+        self._paired_trades_cache = None
 
         self._profits: list[float] = []
         self._losses: list[float] = []  # negative profits (losses)
@@ -233,6 +241,32 @@ class TesterStats:
     def symbols(self):
         """The number of symbols seen during the backtest"""
         return self.symbols_
+
+    @property
+    def paired_trades(self):
+        """Deals paired into round-trip trades (see analytics.pair_trades)."""
+        if self._paired_trades_cache is None:
+            self._paired_trades_cache = analytics.pair_trades(self.deals)
+        return self._paired_trades_cache
+
+    @property
+    def advanced_metrics(self):
+        """Risk-adjusted metrics: Sharpe/Sortino/Calmar, drawdown durations,
+        Ulcer index, expectancy in R, SQN and trade-outcome VaR/CVaR."""
+        if self._advanced_cache is None:
+            self._advanced_cache = analytics.advanced_metrics(
+                equity_curve=self.equity_curve,
+                balance_curve=self.balance_curve,
+                times=self.curve_times,
+                trades=self.paired_trades,
+                initial_deposit=self.initial_deposit_,
+            )
+        return self._advanced_cache
+
+    @property
+    def trade_analysis(self):
+        """Closed-trade breakdowns by symbol, direction, entry hour and weekday."""
+        return analytics.trade_breakdowns(self.paired_trades)
 
     @property
     def total_trades(self) -> int:

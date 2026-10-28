@@ -163,6 +163,8 @@ class StrategyTester:
         self.DASHBOARD_STATE = DashboardState()
         self.last_tick_time: int = 0
         self._last_dashboard_update = 0.0
+        self._annotations_sent = 0  # deals already streamed to the dashboard as chart annotations
+        self._last_price_emit = 0.0
 
     def _tester_init(self, is_optimization_mode: bool) -> bool:
         """
@@ -597,6 +599,80 @@ class StrategyTester:
 
                         socketio.sleep(0)
 
+        # stream chart annotations (entries/exits) and the price feed,
+        # independent of whether any position is currently open
+        if not self.IS_OPTIMIZATION_MODE:
+            self._emit_trade_annotations()
+
+    def _emit_trade_annotations(self) -> None:
+        """
+        Stream new deals and the primary symbol's price to the dashboard so
+        the price chart can annotate entries, exits and SL/TP levels in real
+        time while the backtest is running.
+        """
+
+        deals = self.simulated_mt5.DEALS
+
+        while self._annotations_sent < len(deals):
+            deal = deals[self._annotations_sent]
+            self._annotations_sent += 1
+
+            if deal.type not in (self.simulated_mt5.DEAL_TYPE_BUY, self.simulated_mt5.DEAL_TYPE_SELL):
+                continue
+
+            is_entry = deal.entry == self.simulated_mt5.DEAL_ENTRY_IN
+            is_exit = deal.entry in (self.simulated_mt5.DEAL_ENTRY_OUT, self.simulated_mt5.DEAL_ENTRY_INOUT)
+            if not (is_entry or is_exit):
+                continue
+
+            if is_entry:
+                direction = "long" if deal.type == self.simulated_mt5.DEAL_TYPE_BUY else "short"
+            else:
+                # a closing deal has the opposite type of the position it closes
+                direction = "short" if deal.type == self.simulated_mt5.DEAL_TYPE_BUY else "long"
+
+            annotation = {
+                "time": datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
+                "symbol": deal.symbol,
+                "kind": "entry" if is_entry else "exit",
+                "direction": direction,
+                "price": deal.price,
+                "volume": deal.volume,
+                "profit": deal.profit if is_exit else None,
+                "position_id": deal.position_id,
+                "sl": None,
+                "tp": None,
+            }
+
+            if is_entry:
+                for position in self.simulated_mt5.POSITIONS:
+                    if position.identifier == deal.position_id:
+                        annotation["sl"] = position.sl
+                        annotation["tp"] = position.tp
+                        break
+
+            socketio.emit("trade_annotation", annotation)
+            socketio.sleep(0)
+
+        # throttled price feed for the primary symbol's chart line
+        now = time.perf_counter()
+        if now - self._last_price_emit >= 0.1:
+            self._last_price_emit = now
+            symbols = self.tester_config.get("symbols") or []
+            if symbols:
+                tick = self.simulated_mt5.symbol_info_tick(symbols[0])
+                if tick is not None:
+                    socketio.emit(
+                        "price_update",
+                        {
+                            "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat(),
+                            "symbol": symbols[0],
+                            "bid": tick.bid,
+                            "ask": tick.ask,
+                        },
+                    )
+                    socketio.sleep(0)
+
     def _run_tick_simulation(
             self,
             df: pl.DataFrame,
@@ -643,26 +719,75 @@ class StrategyTester:
                 # call strategy AFTER all symbols updated
                 on_tick_function()
 
+    @staticmethod
+    def _bar_tick_prices(open_: float, high: float, low: float, close: float,
+                         modelling: int, ticks_per_segment: int = 4) -> list:
+        """
+        Build the ordered bid prices the simulator visits inside a single bar.
+
+        * modelling 2 (open price only): just the open.
+        * modelling 1 (OHLC): the four bar points. A bar that closes above
+          its open is assumed to visit its low before its high, and a bar
+          that closes below its open the other way round.
+        * modelling 0 (every tick, generated): the OHLC path with each
+          segment subdivided into ``ticks_per_segment`` linearly
+          interpolated ticks, giving a deterministic generated-tick stream.
+        """
+        if modelling == 2:
+            return [open_]
+
+        if close >= open_:
+            path = [open_, low, high, close]
+        else:
+            path = [open_, high, low, close]
+
+        if modelling == 1:
+            deduped = []
+            for price in path:
+                if not deduped or price != deduped[-1]:
+                    deduped.append(price)
+            return deduped
+
+        ticks = []
+        for segment_start, segment_end in zip(path, path[1:]):
+            for step in range(ticks_per_segment):
+                fraction = step / ticks_per_segment
+                ticks.append(segment_start + (segment_end - segment_start) * fraction)
+        ticks.append(path[-1])
+        return ticks
+
     def _run_bar_simulation(
             self,
             df: pl.DataFrame,
             symbols: list[str],
             on_tick_function,
-            dashboard_fps: int = 60
+            dashboard_fps: int = 60,
+            modelling: int = 2,
+            bar_period_seconds: int = 60
     ):
 
         """
-        This function Drives the strategy tester using grouped bars.
+        Drives the strategy tester using bars expanded into tick paths.
+
+        Each bar is converted into a sequence of ticks according to the
+        modelling mode (see `_bar_tick_prices`): the virtual terminal is
+        updated tick by tick, positions and pending orders are monitored
+        after every generated tick (so stop-loss / take-profit levels can
+        trigger inside the bar) and the strategy callback runs on every
+        generated tick, mirroring the real-tick simulation.
 
         Args:
-            df (pl.DataFrame): A Polars DataFrame containing bars data, with columns for time, open, high, low, close, etc.
-            symbols (list[str]): A list mapping symbol_id to actual symbol names.
-            on_tick_function: A callback function that executes the strategy logic on each tick. This function is called after all ticks for a given timestamp are processed and the simulated MetaTrader5 instance is updated with the latest tick information.
-            dashboard_fps: The interval to update the chart on a browser alongside the trades table with other active values such as balance, equity, etc.
+            df (pl.DataFrame): Bars with time, open, high, low, close, spread
+                and tick_volume columns.
+            symbols (list[str]): Maps symbol_id to the symbol name.
+            on_tick_function: Strategy callback executed on each tick.
+            dashboard_fps: Dashboard update rate limit.
+            modelling (int): Tester modelling mode (0, 1 or 2).
+            bar_period_seconds (int): Duration of one bar in seconds, used to
+                spread the generated ticks inside the bar.
         """
 
         total_rows = df.height
-        processed = 0
 
         grouped = df.group_by("time", maintain_order=True)
         with tqdm(total=total_rows, desc="StrategyTester Progress", unit="bar") as pbar:
@@ -672,7 +797,6 @@ class StrategyTester:
             for _, rows in grouped:
                 n = rows.height
 
-                # process all ticks at this timestamp
                 for row in rows.iter_rows(named=True):
                     symbol = symbols[row["symbol_id"]]
 
@@ -683,33 +807,43 @@ class StrategyTester:
                         continue
 
                     current_time = row["time"]
-
-                    tick = Tick(
-                        time=current_time,
-                        bid=row["close"],
-                        ask=row["close"] + row["spread"] * s_info.point,
-                        last=0,
-                        volume=row["tick_volume"],
-                        time_msc=row["time"] * 1000,
-                        flags=-1,
-                        volume_real=0
+                    spread_price = row["spread"] * s_info.point
+                    prices = self._bar_tick_prices(
+                        row["open"], row["high"], row["low"], row["close"], modelling
                     )
+                    tick_count = len(prices)
 
-                    self.simulated_mt5.tick_update(symbol, tick)
+                    for index, bid in enumerate(prices):
+                        offset = bar_period_seconds * index / tick_count if tick_count > 1 else 0
+                        tick_time = int(current_time + offset)
+
+                        tick = Tick(
+                            time=tick_time,
+                            bid=bid,
+                            ask=bid + spread_price,
+                            last=0,
+                            volume=row["tick_volume"],
+                            time_msc=int((current_time + offset) * 1000),
+                            flags=-1,
+                            volume_real=0
+                        )
+
+                        self.simulated_mt5.tick_update(symbol, tick)
+                        self._monitor_mt5(current_time=tick_time, dashboard_fps=dashboard_fps)
+                        on_tick_function()
+
+                        if self.IS_MARGIN_STOPOUT:
+                            break
+
+                    if self.IS_MARGIN_STOPOUT:
+                        break
 
                 if self.IS_MARGIN_STOPOUT:
                     break
 
-                self._monitor_mt5(current_time=current_time, dashboard_fps=dashboard_fps)
-
-                # update progress AFTER processing group
-                processed += n
                 self.TESTER_IDX += 1  # increment tester progress
 
                 pbar.update(n)
-
-                # call strategy AFTER all symbols updated
-                on_tick_function()
 
     def run(self,
             on_tick_function: Any,
@@ -796,17 +930,20 @@ class StrategyTester:
                 dashboard_fps=dashboard_fps
             )
 
-        elif modelling in (2, 1):
+        elif modelling in (2, 1, 0):
 
             if not self._tester_init(is_optimization_mode=self.IS_OPTIMIZATION_MODE):  # initialize the tester
                 self.error_log("Failed to initialize StrategyTester")
                 return
 
             if self.IS_OPTIMIZATION_FIRST_RUN:
+                bar_timeframe = (
+                    self.simulated_mt5.STRING2TIMEFRAME_MAP["M1"] if modelling in (0, 1)
+                    else self.simulated_mt5.STRING2TIMEFRAME_MAP[timeframe]
+                )
                 self.history_dataframe = self.history_manager.build_bar_stream(
                     symbols,
-                    self.simulated_mt5.STRING2TIMEFRAME_MAP["M1"] if modelling == 1 else
-                    self.simulated_mt5.STRING2TIMEFRAME_MAP[timeframe],
+                    bar_timeframe,
                     start_date,
                     end_date,
                     True,
@@ -815,12 +952,14 @@ class StrategyTester:
 
             self._initialize_curves(tick_size=self.history_dataframe.height)
 
-            # run bar simulation
+            # run bar simulation (bars are expanded into tick paths)
             self._run_bar_simulation(
                 self.history_dataframe,
                 symbols,
                 on_tick_function,
-                dashboard_fps=dashboard_fps
+                dashboard_fps=dashboard_fps,
+                modelling=modelling,
+                bar_period_seconds=PeriodSeconds(bar_timeframe)
             )
 
         # ---------------------- END OF THE TEST ---------------------
@@ -836,6 +975,14 @@ class StrategyTester:
 
             # Save trading history (orders & deals) into separate CSV files
             self._save_trading_history(self.trading_history_dir)
+
+            # Save the detailed trade analysis (paired trades, breakdowns,
+            # advanced metrics) as JSON alongside the CSV history
+            if tester_stats:
+                self._save_trade_analysis(self.trading_history_dir, tester_stats)
+
+            # Export an MT5 visual trade replay (CSV + companion MQL5 script)
+            self._export_mt5_replay()
 
             # introduce backtest report to the dashboard
             self.DASHBOARD_STATE.simulation_running = False
@@ -869,10 +1016,9 @@ class StrategyTester:
 
             time.sleep(1)
             print(
-                "\n📈 Visualize your backtesting progress on MetaTrader 5 charts.\n"
-                "See entries, exits, SL/TP levels and trade history directly in MT5.\n"
-                "Professional Edition:\n"
-                "https://omegajoctan.gumroad.com/l/strategytester5-professional"
+                "\n📈 Visualize this backtest inside MetaTrader 5:\n"
+                "attach the TradeReplay script (MQL5/Scripts) to the traded symbol's chart "
+                "to replay entries, exits, SL/TP levels and per-trade profit step by step."
             )
 
         else:
@@ -890,7 +1036,7 @@ class StrategyTester:
             self.critical_log("It seems no iterations looped through in the method `run()`")
             return None
 
-        # t = curves["time"][:n]
+        t = curves["time"][:n]
         bal = curves["balance"][:n]
         eq = curves["equity"][:n]
         margin_level = curves["margin_level"][:n]
@@ -903,6 +1049,7 @@ class StrategyTester:
             equity_curve=eq,
             margin_level_curve=margin_level,
             ticks=self.TESTER_IDX,
+            times=t,
         )
 
     def _make_balance_deal(self, current_time: datetime) -> TradeDeal:
@@ -966,6 +1113,57 @@ class StrategyTester:
 
         except Exception as e:
             self.warning_log(f"Failed to save trading history: {e!r}")
+
+    def _save_trade_analysis(self, path: str, tester_stats: TesterStats):
+        """Persist the detailed trade analysis (paired trades, breakdowns and
+        advanced metrics) as JSON next to the orders/deals CSV files."""
+
+        hist_dir = Path(path)
+        hist_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            payload = {
+                "advanced_metrics": tester_stats.advanced_metrics,
+                "trade_analysis": tester_stats.trade_analysis,
+                "trades": tester_stats.paired_trades,
+            }
+            analysis_file = hist_dir / "trade_analysis.json"
+            analysis_file.write_text(json.dumps(payload, default=str, indent=2), encoding="utf-8")
+
+        except Exception as e:
+            self.warning_log(f"Failed to save trade analysis: {e!r}")
+
+    def _export_mt5_replay(self):
+        """Export the backtest trades as an MT5 replay file and, when the
+        parent terminal is reachable, install the CSV and the TradeReplay
+        script into the terminal so the replay can be attached to a chart."""
+
+        try:
+            from . import replay
+
+            csv_path = replay.export_mt5_replay(
+                self.simulated_mt5.DEALS,
+                self.simulated_mt5.ORDERS_HISTORY,
+                self.trading_history_dir,
+                self.ea_name,
+            )
+            if csv_path is None:
+                return
+
+            installed = replay.install_replay_assets(self.simulated_mt5.parent_mt5, csv_path)
+            if installed:
+                self.info_log(
+                    "MT5 trade replay installed: " + "; ".join(installed)
+                    + ". Open the traded symbol's chart in MT5 and attach the TradeReplay script."
+                )
+            else:
+                self.info_log(
+                    f"MT5 trade replay exported to {csv_path}. Copy it into the terminal's "
+                    "MQL5/Files folder and attach the TradeReplay script to replay the trades."
+                )
+
+        except Exception as e:
+            self.warning_log(f"Failed to export MT5 trade replay: {e!r}")
 
     @staticmethod
     def generate_entries_pl_plot_json(deals_df: pd.DataFrame) -> str:
